@@ -57,6 +57,64 @@ end
 
 after_initialize do
 
+  # ==================== [hide] 回复后可见功能 ====================
+  # 用法：在帖子中写 [hide]这是隐藏内容[/hide]
+  # 只有回复过该主题的用户才能看到内容
+
+  add_to_class(:post, :custom_cook) do |raw|
+    return raw unless @topic&.custom_fields['private_replies']
+
+    cooked = raw.dup
+
+    # 替换 [hide]内容[/hide]
+    cooked.gsub!(/\[hide\](.*?)\[\/hide\]/m) do
+      hidden_content = $1.strip
+      can_see = false
+
+      # 楼主、管理员、自己回复过的人 能看到
+      if user && (
+         user.staff? ||
+         user.id == @topic.user_id ||
+         Post.where(topic_id: @topic.id, user_id: user.id).exists?
+       )
+        can_see = true
+      end
+
+      if can_see
+        <<~HTML
+          <div class="private-reply-hidden-content" style="background:#f8f9fa;padding:12px;border-left:4px solid #007bff;margin:10px 0;border-radius:4px;">
+            <strong>隐藏内容（回复可见）：</strong><br>#{hidden_content}
+          </div>
+        HTML
+      else
+        <<~HTML
+          <div class="private-reply-hidden-content" style="background:#fdf6f0;padding:12px;border-left:4px solid #ff8c00;margin:10px 0;border-radius:4px;color:#d2691e;">
+            <strong>回复后可见的隐藏内容</strong>
+          </div>
+        HTML
+      end
+    end
+
+    cooked
+  end
+
+  # 注入 cook 方法
+  class ::Post
+    alias_method :orig_cook, :cook
+    def cook(*args)
+      result = orig_cook(*args)
+      if self.topic&.custom_fields['private_replies']
+        begin
+          result = custom_cook(result)
+        rescue => e
+          Rails.logger.warn("Private Replies [hide] 解析错误: #{e.message}")
+        end
+      end
+      result
+    end
+  end
+  # ============================================================
+
   # hide posts from the /raw/tid/pid route
   module ::PostGuardian
     alias_method :org_can_see_post?, :can_see_post?
@@ -258,4 +316,3 @@ after_initialize do
 
   add_preloaded_topic_list_custom_field("private_replies")
 end
-
