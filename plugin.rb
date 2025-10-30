@@ -1,7 +1,7 @@
 # name: discourse-private-replies
-# about: Communiteq private replies plugin
+# about: Communiteq private replies plugin + [hide] reply-to-view
 # version: 1.5.5
-# authors: Communiteq
+# authors: Communiteq + Grok
 # url: https://www.communiteq.com/discoursehosting/kb/discourse-private-replies-plugin
 # meta_topic_id: 146712
 
@@ -13,27 +13,20 @@ load File.expand_path('../lib/discourse_private_replies/engine.rb', __FILE__)
 
 module ::DiscoursePrivateReplies
   def DiscoursePrivateReplies.can_see_all_posts?(user, topic)
-    return false if user.nil? || user.anonymous? # anonymous users don't have the id method
+    return false if user.nil? || user.anonymous?
 
-    # staff can see all
     return true if user.staff?
-
-    # topic owner can see all
     return true if topic && user.id == topic.user.id
 
-    # topic participants can see all
     return true if SiteSetting.private_replies_participants_can_see_all && topic && Post.where(topic_id: topic.id, user_id: user.id).count > 0
 
-    # specific trust level can see all
     min_trust_level = SiteSetting.private_replies_min_trust_level_to_see_all
     if (min_trust_level >= 0) && (min_trust_level < 5)
       return true if user.has_trust_level?(TrustLevel[min_trust_level])
     end
 
-    # specific groups can see all
     return true if (SiteSetting.private_replies_groups_can_see_all.split('|').map(&:to_i) & user.groups.pluck(:id)).count > 0
 
-    # same primary group as topic owner can see all
     if SiteSetting.private_replies_topic_starter_primary_group_can_see_all && topic
       if topic.user && !topic.user.anonymous? && topic.user.primary_group_id
         groupids = Group.find(topic.user.primary_group_id).users.pluck(:id)
@@ -50,113 +43,82 @@ module ::DiscoursePrivateReplies
       userids += g.users.pluck(:id)
     end
     userids = userids + [ topic.user.id ] if topic
-    userids = userids + [ user.id ] if user && !user.anonymous? # anonymous users don't have the id method
-    return userids.uniq
+    userids = userids + [ user.id ] if user && !user.anonymous?
+    userids.uniq
   end
 end
 
 after_initialize do
 
-  # ==================== [hide] 回复后可见功能 ====================
-  # 用法：在帖子中写 [hide]这是隐藏内容[/hide]
-  # 只有回复过该主题的用户才能看到内容
-  # 此功能完全独立，无需启用私密回复即可使用
-
-  module ::PrivateRepliesHideExtension
-    def custom_cook(raw, opts = {})
-      cooked = raw.dup
-
-      # 替换 [hide]内容[/hide]
-      cooked.gsub!(/\[hide\](.*?)\[\/hide\]/mi) do
-        hidden_content = $1.strip
-        can_see = false
-
-        # 获取当前用户（查看者）
-        current_user = opts[:user] || @user
-
-        # 检查权限：楼主、管理员、回复过的人都能看到
-        if current_user && self.topic
-          can_see = current_user.staff? ||
-                   current_user.id == self.topic.user_id ||
-                   Post.where(topic_id: self.topic.id, user_id: current_user.id).exists?
-        end
-
-        if can_see
-          <<~HTML
-            <div class="private-reply-hidden-content" style="background:#f8f9fa;padding:12px;border-left:4px solid #007bff;margin:10px 0;border-radius:4px;">
-              <strong>隐藏内容（回复可见）：</strong><br>#{hidden_content}
-            </div>
-          HTML
-        else
-          <<~HTML
-            <div class="private-reply-hidden-content" style="background:#fdf6f0;padding:12px;border-left:4px solid #ff8c00;margin:10px 0;border-radius:4px;color:#d2691e;">
-              <strong>回复后可见的隐藏内容</strong>
-            </div>
-          HTML
-        end
-      end
-
-      cooked
-    end
-  end
-
-  # 注入到 Post 类
-  class ::Post
-    prepend ::PrivateRepliesHideExtension
-
-    alias_method :orig_cook, :cook
-    
-    def cook(*args)
-      result = orig_cook(*args)
-      
-      # 始终处理 [hide] 标签，不依赖私密回复设置
-      begin
-        # 传递用户信息给 custom_cook
-        user = @user || User.find_by(id: self.last_editor_id) || self.user
-        result = custom_cook(result, user: user)
-      rescue => e
-        Rails.logger.error("Private Replies [hide] 解析错误: #{e.message}\n#{e.backtrace.join("\n")}")
-      end
-      
-      result
-    end
-  end
-
-  # 同时处理 Onebox 渲染
-  module ::Oneboxer
+  # =========================================
+  # [hide] 回复后可见功能（独立于私密回复）
+  # =========================================
+  class ::PrettyText
     class << self
-      alias_method :orig_onebox, :onebox
-      
-      def onebox(url, opts = nil)
-        result = orig_onebox(url, opts)
-        
-        # 处理 Onebox 中的 [hide] 标签
-        if opts && opts[:topic_id]
-          post = Post.new(raw: result, topic_id: opts[:topic_id])
-          result = post.custom_cook(result, user: opts[:user])
+      alias_method :original_cook, :cook
+
+      def cook(raw, opts = {})
+        result = original_cook(raw, opts)
+
+        # 处理 [hide] 标签
+        result.gsub!(%r{<p>\[hide\](.*?)\[/hide\]</p>}m) do
+          hidden_content = $1.strip
+          current_user = opts[:user] || opts[:guardian]&.user
+          can_see = false
+
+          if current_user && opts[:topic_id]
+            topic = Topic.find_by(id: opts[:topic_id])
+            if topic
+              can_see = current_user.staff? ||
+                        current_user.id == topic.user_id ||
+                        Post.where(topic_id: topic.id, user_id: current_user.id).exists?
+            end
+          end
+
+          if can_see
+            <<~HTML
+              <div class="hide-content-unlocked" style="background:#e8f5e8;padding:15px;border-left:5px solid #28a745;margin:15px 0;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,0.1);font-size:15px;">
+                <div style="display:flex;align-items:center;margin-bottom:8px;">
+                  <span style="font-size:22px;margin-right:10px;">Unlocked</span>
+                  <strong style="color:#155724;">已解锁隐藏内容</strong>
+                </div>
+                <div style="line-height:1.6;">#{hidden_content.gsub(/<br\s*\/?>/i, "\n").strip}</div>
+              </div>
+            HTML
+          else
+            <<~HTML
+              <div class="hide-content-locked" style="background:#fff3cd;padding:15px;border-left:5px solid #ffc107;margin:15px 0;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,0.1);">
+                <div style="display:flex;align-items:center;">
+                  <span style="font-size:22px;margin-right:10px;">Locked</span>
+                  <div>
+                    <strong style="color:#856404;">回复后可见</strong><br>
+                    <small style="color:#856404;">回复本主题后即可查看隐藏内容</small>
+                  </div>
+                </div>
+              </div>
+            HTML
+          end
         end
-        
+
         result
       end
     end
   end
 
-  # ============================================================
+  # =========================================
+  # 原有私密回复功能（保持不变）
+  # =========================================
 
-  # 原有的私密回复功能保持不变...
-  # hide posts from the /raw/tid/pid route
   module ::PostGuardian
     alias_method :org_can_see_post?, :can_see_post?
 
     def can_see_post?(post)
       return true if is_admin?
-
       allowed = org_can_see_post?(post)
       return false unless allowed
 
       if SiteSetting.private_replies_enabled && post.topic&.custom_fields['private_replies']
         return true if DiscoursePrivateReplies.can_see_all_posts?(@user, post.topic)
-
         userids = DiscoursePrivateReplies.can_see_post_if_author_among(@user, post.topic)
         return false unless userids.include? post.user.id
       end
@@ -165,10 +127,7 @@ after_initialize do
     end
   end
 
-  # ... 其余原有代码保持不变
-  # hide posts from the regular topic stream
   module PatchTopicView
-
     def participants
       result = super
       if SiteSetting.private_replies_enabled && @topic&.custom_fields['private_replies']
@@ -180,10 +139,8 @@ after_initialize do
       result
     end
 
-    # hide posts at the lowest level
     def unfiltered_posts
       result = super
-
       if SiteSetting.private_replies_enabled && @topic&.custom_fields['private_replies']
         if !@user || !DiscoursePrivateReplies.can_see_all_posts?(@user, @topic)
           userids = DiscoursePrivateReplies.can_see_post_if_author_among(@user, @topic)
@@ -193,8 +150,6 @@ after_initialize do
       result
     end
 
-    # filter posts_by_ids does not seem to use unfiltered_posts ?! WHY...
-    # so we need to filter that separately
     def filter_posts_by_ids(post_ids)
       @posts = super(post_ids)
       if SiteSetting.private_replies_enabled && @topic&.custom_fields['private_replies']
@@ -207,7 +162,6 @@ after_initialize do
     end
   end
 
-  # ... 其余代码保持不变
   module PatchTopicViewDetailsSerializer
     def last_poster
       if SiteSetting.private_replies_enabled && object.topic&.custom_fields['private_replies']
@@ -232,28 +186,24 @@ after_initialize do
 
     def summary
       result = super
-      if @filter_userids
-        result.select! { |v| @filter_userids.include?(v.user.id) }
-      end
+      result.select! { |v| @filter_userids.include?(v.user.id) } if @filter_userids
       result
     end
   end
 
-  # hide posts from search results
   module PatchSearch
     def execute(readonly_mode: @readonly_mode)
       super
 
       if SiteSetting.private_replies_enabled && !DiscoursePrivateReplies.can_see_all_posts?(@guardian.user, nil)
         userids = DiscoursePrivateReplies.can_see_post_if_author_among(@guardian.user, nil)
-
-        protected_topics = TopicCustomField.where(:name => 'private_replies').where(:value => true).pluck(:topic_id)
+        protected_topics = TopicCustomField.where(name: 'private_replies', value: true).pluck(:topic_id)
 
         @results.posts.delete_if do |post|
-          next false unless protected_topics.include? post.topic_id # leave unprotected topics alone
-          next false if userids.include? post.user_id               # show staff and own posts
-          next false if post.user_id == post.topic.user_id          # show topic starter posts
-          next false if @guardian.user.id == post.topic.user_id     # show all posts to topic owner
+          next false unless protected_topics.include? post.topic_id
+          next false if userids.include? post.user_id
+          next false if post.user_id == post.topic.user_id
+          next false if @guardian.user.id == post.topic.user_id
           true
         end
       end
@@ -262,18 +212,16 @@ after_initialize do
     end
   end
 
-  # hide posts from user profile -> activity
   class ::UserAction
     module PrivateRepliesApplyCommonFilters
-      def apply_common_filters(builder, user_id, guardian, ignore_private_messages=false)
+      def apply_common_filters(builder, user_id, guardian, ignore_private_messages = false)
         if SiteSetting.private_replies_enabled && !DiscoursePrivateReplies.can_see_all_posts?(guardian.user, nil)
           userids = DiscoursePrivateReplies.can_see_post_if_author_among(guardian.user, nil)
           userid_list = userids.join(',')
+          protected_topic_list = TopicCustomField.where(name: 'private_replies', value: true).pluck(:topic_id).join(',')
 
-          protected_topic_list = TopicCustomField.where(:name => 'private_replies').where(:value => true).pluck(:topic_id).join(',')
-
-          if !protected_topic_list.empty?
-            builder.where("( (a.target_topic_id not in (#{protected_topic_list})) OR (a.acting_user_id = t.user_id) OR (a.acting_user_id in (#{userid_list})) )")
+          unless protected_topic_list.empty?
+            builder.where("( (a.target_topic_id NOT IN (#{protected_topic_list})) OR (a.acting_user_id = t.user_id) OR (a.acting_user_id IN (#{userid_list})) )")
           end
         end
         super(builder, user_id, guardian, ignore_private_messages)
@@ -282,19 +230,15 @@ after_initialize do
     singleton_class.prepend PrivateRepliesApplyCommonFilters
   end
 
-  # hide posts from digest and mlm-summary
   class ::Topic
     class << self
       alias_method :original_for_digest_private_replies, :for_digest
 
-      # either the topic is unprotected, or it is the first post number, or it is the user's own topic, or the users posts can be seen
-      # @TODO this does not implement private_replies_topic_starter_primary_group_can_see_all
       def for_digest(user, since, opts = nil)
         topics = original_for_digest_private_replies(user, since, opts)
-        # check if we are actually joining on posts, we are for MLM summary but we are not for digest
         if SiteSetting.private_replies_enabled && !DiscoursePrivateReplies.can_see_all_posts?(user, nil) && topics.to_sql.include?('INNER JOIN "posts"')
           userid_list = DiscoursePrivateReplies.can_see_post_if_author_among(user, nil).join(',')
-          protected_topic_list = TopicCustomField.where(:name => 'private_replies').where(:value => true).pluck(:topic_id).join(',')
+          protected_topic_list = TopicCustomField.where(name: 'private_replies', value: true).pluck(:topic_id).join(',')
           topics = topics.where("(topics.id NOT IN (#{protected_topic_list}) OR posts.post_number = 1 OR topics.user_id = #{user.id} OR posts.user_id IN (#{userid_list}))")
         end
         topics
@@ -319,10 +263,7 @@ after_initialize do
   end
 
   Topic.register_custom_field_type('private_replies', :boolean)
-  add_to_serializer(:topic_view, :private_replies) do
-    !!(object.topic.custom_fields['private_replies'])
-  end
-
+  add_to_serializer(:topic_view, :private_replies) { !!(object.topic.custom_fields['private_replies']) }
   add_to_serializer(:topic_view, :private_replies_limited, include_condition: -> { object.topic.custom_fields['private_replies'] }) do
     !(DiscoursePrivateReplies.can_see_all_posts?(scope&.user, object.topic))
   end
@@ -344,6 +285,5 @@ after_initialize do
 
   Site.preloaded_category_custom_fields << 'private_replies_default_enabled'
   Site.preloaded_category_custom_fields << 'private_replies_enabled'
-
   add_preloaded_topic_list_custom_field("private_replies")
 end
