@@ -57,14 +57,12 @@ end
 
 after_initialize do
 
-  # ========================================
-  # [hide] 回复后可见功能（安全注入）
-  # ========================================
+  
   module HideReplyToView
     def cook(raw, opts = {})
       result = super(raw, opts)
 
-      # 精确匹配 <p>[hide]内容[/hide]</p>
+      # 匹配 [hide]内容[/hide]（支持换行、多行）
       result.gsub!(%r{<p>\s*\[hide\](.*?)\[/hide\]\s*</p>}m) do
         content = $1.strip
         current_user = opts[:user] || opts[:guardian]&.user
@@ -101,12 +99,6 @@ after_initialize do
     end
   end
 
-  # 安全注入 PrettyText
-  ::PrettyText.prepend HideReplyToView
-
-  # ========================================
-  # 原有私密回复功能（100% 保留）
-  # ========================================
 
   # hide posts from the /raw/tid/pid route
   module ::PostGuardian
