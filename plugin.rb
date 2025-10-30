@@ -60,61 +60,90 @@ after_initialize do
   # ==================== [hide] 回复后可见功能 ====================
   # 用法：在帖子中写 [hide]这是隐藏内容[/hide]
   # 只有回复过该主题的用户才能看到内容
+  # 此功能完全独立，无需启用私密回复即可使用
 
-  add_to_class(:post, :custom_cook) do |raw|
-    return raw unless @topic&.custom_fields['private_replies']
+  module ::PrivateRepliesHideExtension
+    def custom_cook(raw, opts = {})
+      cooked = raw.dup
 
-    cooked = raw.dup
+      # 替换 [hide]内容[/hide]
+      cooked.gsub!(/\[hide\](.*?)\[\/hide\]/mi) do
+        hidden_content = $1.strip
+        can_see = false
 
-    # 替换 [hide]内容[/hide]
-    cooked.gsub!(/\[hide\](.*?)\[\/hide\]/m) do
-      hidden_content = $1.strip
-      can_see = false
+        # 获取当前用户（查看者）
+        current_user = opts[:user] || @user
 
-      # 楼主、管理员、自己回复过的人 能看到
-      if user && (
-         user.staff? ||
-         user.id == @topic.user_id ||
-         Post.where(topic_id: @topic.id, user_id: user.id).exists?
-       )
-        can_see = true
-      end
+        # 检查权限：楼主、管理员、回复过的人都能看到
+        if current_user && self.topic
+          can_see = current_user.staff? ||
+                   current_user.id == self.topic.user_id ||
+                   Post.where(topic_id: self.topic.id, user_id: current_user.id).exists?
+        end
 
-      if can_see
-        <<~HTML
-          <div class="private-reply-hidden-content" style="background:#f8f9fa;padding:12px;border-left:4px solid #007bff;margin:10px 0;border-radius:4px;">
-            <strong>隐藏内容（回复可见）：</strong><br>#{hidden_content}
-          </div>
-        HTML
-      else
-        <<~HTML
-          <div class="private-reply-hidden-content" style="background:#fdf6f0;padding:12px;border-left:4px solid #ff8c00;margin:10px 0;border-radius:4px;color:#d2691e;">
-            <strong>回复后可见的隐藏内容</strong>
-          </div>
-        HTML
-      end
-    end
-
-    cooked
-  end
-
-  # 注入 cook 方法
-  class ::Post
-    alias_method :orig_cook, :cook
-    def cook(*args)
-      result = orig_cook(*args)
-      if self.topic&.custom_fields['private_replies']
-        begin
-          result = custom_cook(result)
-        rescue => e
-          Rails.logger.warn("Private Replies [hide] 解析错误: #{e.message}")
+        if can_see
+          <<~HTML
+            <div class="private-reply-hidden-content" style="background:#f8f9fa;padding:12px;border-left:4px solid #007bff;margin:10px 0;border-radius:4px;">
+              <strong>隐藏内容（回复可见）：</strong><br>#{hidden_content}
+            </div>
+          HTML
+        else
+          <<~HTML
+            <div class="private-reply-hidden-content" style="background:#fdf6f0;padding:12px;border-left:4px solid #ff8c00;margin:10px 0;border-radius:4px;color:#d2691e;">
+              <strong>回复后可见的隐藏内容</strong>
+            </div>
+          HTML
         end
       end
+
+      cooked
+    end
+  end
+
+  # 注入到 Post 类
+  class ::Post
+    prepend ::PrivateRepliesHideExtension
+
+    alias_method :orig_cook, :cook
+    
+    def cook(*args)
+      result = orig_cook(*args)
+      
+      # 始终处理 [hide] 标签，不依赖私密回复设置
+      begin
+        # 传递用户信息给 custom_cook
+        user = @user || User.find_by(id: self.last_editor_id) || self.user
+        result = custom_cook(result, user: user)
+      rescue => e
+        Rails.logger.error("Private Replies [hide] 解析错误: #{e.message}\n#{e.backtrace.join("\n")}")
+      end
+      
       result
     end
   end
+
+  # 同时处理 Onebox 渲染
+  module ::Oneboxer
+    class << self
+      alias_method :orig_onebox, :onebox
+      
+      def onebox(url, opts = nil)
+        result = orig_onebox(url, opts)
+        
+        # 处理 Onebox 中的 [hide] 标签
+        if opts && opts[:topic_id]
+          post = Post.new(raw: result, topic_id: opts[:topic_id])
+          result = post.custom_cook(result, user: opts[:user])
+        end
+        
+        result
+      end
+    end
+  end
+
   # ============================================================
 
+  # 原有的私密回复功能保持不变...
   # hide posts from the /raw/tid/pid route
   module ::PostGuardian
     alias_method :org_can_see_post?, :can_see_post?
@@ -136,6 +165,7 @@ after_initialize do
     end
   end
 
+  # ... 其余原有代码保持不变
   # hide posts from the regular topic stream
   module PatchTopicView
 
@@ -177,6 +207,7 @@ after_initialize do
     end
   end
 
+  # ... 其余代码保持不变
   module PatchTopicViewDetailsSerializer
     def last_poster
       if SiteSetting.private_replies_enabled && object.topic&.custom_fields['private_replies']
